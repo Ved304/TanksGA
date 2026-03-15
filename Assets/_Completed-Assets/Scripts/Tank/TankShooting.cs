@@ -21,17 +21,19 @@ namespace Complete
         private float m_CurrentLaunchForce;         // The force that will be given to the shell when the fire button is released.
         private float m_ChargeSpeed;                // How fast the launch force increases, based on the max charge time.
         private bool m_Fired;                       // Whether or not the shell has been launched with this button press.
+        private bool m_IsComputerControlled;        // Set by TankMovement at startup; suppresses player input when true.
+        private bool m_IsCharging;                  // True while the AI is actively charging a shot.
 
 
         private void OnEnable()
         {
-            // When the tank is turned on, reset the launch force and the UI
+            // When the tank is turned on, reset the launch force and the UI.
             m_CurrentLaunchForce = m_MinLaunchForce;
             m_AimSlider.value = m_MinLaunchForce;
         }
 
 
-        private void Start ()
+        private void Start()
         {
             // The fire axis is based on the player number.
             m_FireButton = "Fire" + m_PlayerNumber;
@@ -41,20 +43,53 @@ namespace Complete
         }
 
 
-        private void Update ()
+        /// <summary>
+        /// Called by TankMovement (or GameManager) to tell this component
+        /// whether it is driven by AI or by a human player.
+        /// </summary>
+        public void SetComputerControlled(bool isComputerControlled)
+        {
+            m_IsComputerControlled = isComputerControlled;
+        }
+
+
+        private void Update()
         {
             // The slider should have a default value of the minimum launch force.
             m_AimSlider.value = m_MinLaunchForce;
+
+            if (m_IsComputerControlled)
+            {
+                // AI input is handled via StartCharging() / Fire() public methods.
+                // We still need to auto-fire if the charge reaches maximum,
+                // and update the aim slider while charging.
+                if (m_IsCharging)
+                {
+                    if (m_CurrentLaunchForce >= m_MaxLaunchForce && !m_Fired)
+                    {
+                        m_CurrentLaunchForce = m_MaxLaunchForce;
+                        Fire();
+                    }
+                    else if (!m_Fired)
+                    {
+                        m_CurrentLaunchForce += m_ChargeSpeed * Time.deltaTime;
+                        m_AimSlider.value = m_CurrentLaunchForce;
+                    }
+                }
+                return; // Skip all player-input handling below.
+            }
+
+            // ---- Player-controlled path (unchanged) ----
 
             // If the max force has been exceeded and the shell hasn't yet been launched...
             if (m_CurrentLaunchForce >= m_MaxLaunchForce && !m_Fired)
             {
                 // ... use the max force and launch the shell.
                 m_CurrentLaunchForce = m_MaxLaunchForce;
-                Fire ();
+                Fire();
             }
             // Otherwise, if the fire button has just started being pressed...
-            else if (Input.GetButtonDown (m_FireButton))
+            else if (Input.GetButtonDown(m_FireButton))
             {
                 // ... reset the fired flag and reset the launch force.
                 m_Fired = false;
@@ -62,42 +97,95 @@ namespace Complete
 
                 // Change the clip to the charging clip and start it playing.
                 m_ShootingAudio.clip = m_ChargingClip;
-                m_ShootingAudio.Play ();
+                m_ShootingAudio.Play();
             }
             // Otherwise, if the fire button is being held and the shell hasn't been launched yet...
-            else if (Input.GetButton (m_FireButton) && !m_Fired)
+            else if (Input.GetButton(m_FireButton) && !m_Fired)
             {
                 // Increment the launch force and update the slider.
                 m_CurrentLaunchForce += m_ChargeSpeed * Time.deltaTime;
-
                 m_AimSlider.value = m_CurrentLaunchForce;
             }
             // Otherwise, if the fire button is released and the shell hasn't been launched yet...
-            else if (Input.GetButtonUp (m_FireButton) && !m_Fired)
+            else if (Input.GetButtonUp(m_FireButton) && !m_Fired)
             {
                 // ... launch the shell.
-                Fire ();
+                Fire();
             }
         }
 
 
-        private void Fire ()
-        {
-            // Set the fired flag so only Fire is only called once.
-            m_Fired = true;
+        // -------------------------------------------------------------------------
+        // Public AI interface
+        // -------------------------------------------------------------------------
 
-            // Create an instance of the shell and store a reference to it's rigidbody.
+        /// <summary>
+        /// Called by TankAI to begin charging a shot.
+        /// Has no effect if a shot is already being charged or was just fired.
+        /// </summary>
+        public void StartCharging()
+        {
+            if (m_IsCharging || m_Fired)
+                return;
+
+            m_Fired = false;
+            m_IsCharging = true;
+            m_CurrentLaunchForce = m_MinLaunchForce;
+
+            m_ShootingAudio.clip = m_ChargingClip;
+            m_ShootingAudio.Play();
+        }
+
+        /// <summary>
+        /// Returns true when the current launch force is sufficient to reach
+        /// <paramref name="targetDistance"/> units. TankAI uses this to decide
+        /// when to release the shot.
+        /// </summary>
+        public bool CanHitTarget(float targetDistance)
+        {
+            // Simple ballistic estimate: range ≈ v² / g  (flat ground, 45° launch).
+            // FireTransform typically pitches slightly upward; this gives a good
+            // enough approximation without needing the exact launch angle.
+            float estimatedRange = (m_CurrentLaunchForce * m_CurrentLaunchForce) / Physics.gravity.magnitude;
+            return estimatedRange >= targetDistance;
+        }
+
+        /// <summary>
+        /// Returns the charge ratio [0, 1] so TankAI can read how charged
+        /// the current shot is (0 = min force, 1 = max force).
+        /// </summary>
+        public float GetChargeRatio()
+        {
+            return Mathf.InverseLerp(m_MinLaunchForce, m_MaxLaunchForce, m_CurrentLaunchForce);
+        }
+
+
+        // -------------------------------------------------------------------------
+        // Firing (private – called internally by both player and AI paths)
+        // -------------------------------------------------------------------------
+
+        /// <summary>
+        /// Instantiates a shell and launches it. Can also be called publicly
+        /// by TankAI when it wants to release a charged shot immediately.
+        /// </summary>
+        public void Fire()
+        {
+            // Set the fired flag so Fire is only called once per charge.
+            m_Fired = true;
+            m_IsCharging = false;
+
+            // Create an instance of the shell and store a reference to its rigidbody.
             Rigidbody shellInstance =
-                Instantiate (m_Shell, m_FireTransform.position, m_FireTransform.rotation) as Rigidbody;
+                Instantiate(m_Shell, m_FireTransform.position, m_FireTransform.rotation) as Rigidbody;
 
             // Set the shell's velocity to the launch force in the fire position's forward direction.
-            shellInstance.velocity = m_CurrentLaunchForce * m_FireTransform.forward; 
+            shellInstance.velocity = m_CurrentLaunchForce * m_FireTransform.forward;
 
             // Change the clip to the firing clip and play it.
             m_ShootingAudio.clip = m_FireClip;
-            m_ShootingAudio.Play ();
+            m_ShootingAudio.Play();
 
-            // Reset the launch force.  This is a precaution in case of missing button events.
+            // Reset the launch force. This is a precaution in case of missing button events.
             m_CurrentLaunchForce = m_MinLaunchForce;
         }
     }
